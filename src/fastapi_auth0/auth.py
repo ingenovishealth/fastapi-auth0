@@ -78,9 +78,7 @@ class JwksDict(TypedDict):
 class Auth0:
     def __init__(self, domain: str, api_audience: str, scopes: Dict[str, str]={},
             auto_error: bool=True, scope_auto_error: bool=True, email_auto_error: bool=False,
-            auth0user_model: Type[Auth0User]=Auth0User,
-            options: dict[str, Any] | None = None,
-        ):
+            auth0user_model: Type[Auth0User]=Auth0User):
         self.domain = domain
         self.audience = api_audience
 
@@ -104,13 +102,13 @@ class Auth0:
             tokenUrl=f'https://{domain}/oauth/token',
             scopes=scopes)
         self.oidc_scheme = OpenIdConnect(openIdConnectUrl=f'https://{domain}/.well-known/openid-configuration')
-        self.options = options or {}
         url = f'https://{self.domain}/.well-known/jwks.json'
         self.jwks_client = PyJWKClient(url)
 
     async def get_user(self,
         security_scopes: SecurityScopes,
         creds: Optional[HTTPAuthorizationCredentials] = Depends(Auth0HTTPBearer(auto_error=False)),
+        options: dict[str, Any] | None = None,
     ) -> Optional[Auth0User]:
         """
         Verify the Authorization: Bearer token and return the user.
@@ -130,7 +128,41 @@ class Auth0:
                 return None
 
         token = creds.credentials
-        payload: Dict = {}
+        payload = self.decode_token(token, options)
+
+        if not payload:
+            return None
+
+        if self.scope_auto_error:
+            token_scope_str: str = payload.get('scope', '')
+
+            if isinstance(token_scope_str, str):
+                token_scopes = token_scope_str.split()
+
+                for scope in security_scopes.scopes:
+                    if scope not in token_scopes:
+                        raise Auth0UnauthorizedException(detail=f'Missing "{scope}" scope',
+                            headers={'WWW-Authenticate': f'Bearer scope="{security_scopes.scope_str}"'})
+            else:
+                # This is an unlikely case but handle it just to be safe (perhaps auth0 will change the scope format)
+                raise Auth0UnauthorizedException(detail='Token "scope" field must be a string')
+
+        try:
+            user = self.auth0_user_model(**payload)
+
+            if self.email_auto_error and not user.email:
+                raise Auth0UnauthorizedException(detail=f'Missing email claim (check auth0 rule "Add email to access token")')
+
+            return user
+
+        except ValidationError as e:
+            logger.error(f'Handled exception parsing Auth0User: "{e}"', exc_info=True)
+            if self.auto_error:
+                raise Auth0UnauthorizedException(detail='Error parsing Auth0User')
+            else:
+                return None
+
+    def decode_token(self, token: str, options: dict[str, Any] | None = None):
         try:
             unverified_header = jwt.get_unverified_header(token)
 
@@ -143,7 +175,8 @@ class Auth0:
                     return None
             try:
                 signing_key = self.jwks_client.get_signing_key_from_jwt(token)
-                leeway = self.options.pop("leeway", 0)
+                options = options or {}
+                leeway = options.pop("leeway", 0)
                 payload = jwt.decode(
                     token,
                     signing_key.key,
@@ -151,8 +184,9 @@ class Auth0:
                     audience=self.audience,
                     issuer=f'https://{self.domain}/',
                     leeway=leeway,
-                    options=self.options,
+                    options=options,
                 )
+                return payload
             except jwt.PyJWKClientError as e:
                 msg = str(e)
                 if self.auto_error:
@@ -196,31 +230,3 @@ class Auth0:
             else:
                 return None
 
-        if self.scope_auto_error:
-            token_scope_str: str = payload.get('scope', '')
-
-            if isinstance(token_scope_str, str):
-                token_scopes = token_scope_str.split()
-
-                for scope in security_scopes.scopes:
-                    if scope not in token_scopes:
-                        raise Auth0UnauthorizedException(detail=f'Missing "{scope}" scope',
-                            headers={'WWW-Authenticate': f'Bearer scope="{security_scopes.scope_str}"'})
-            else:
-                # This is an unlikely case but handle it just to be safe (perhaps auth0 will change the scope format)
-                raise Auth0UnauthorizedException(detail='Token "scope" field must be a string')
-
-        try:
-            user = self.auth0_user_model(**payload)
-
-            if self.email_auto_error and not user.email:
-                raise Auth0UnauthorizedException(detail=f'Missing email claim (check auth0 rule "Add email to access token")')
-
-            return user
-
-        except ValidationError as e:
-            logger.error(f'Handled exception parsing Auth0User: "{e}"', exc_info=True)
-            if self.auto_error:
-                raise Auth0UnauthorizedException(detail='Error parsing Auth0User')
-            else:
-                return None
