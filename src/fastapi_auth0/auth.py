@@ -232,7 +232,7 @@ class Auth0:
 
     def get_auth0_user_from_token(self, token: str, options: dict[str, Any] | None = None) -> Auth0User:
         """Verifies an Auth0 token and returns an Auth0User instance for the decoded information."""
-        payload = self.decode_token(token, options={"leeway": 60, "verify_aud": False})
+        payload = self.decode_token(token, options=options)
         if not payload:
             raise Auth0UnauthenticatedException(
                 detail="Invalid kid header (wrong tenant or rotated public key)"
@@ -241,5 +241,5 @@ class Auth0:
         try:
             return self.auth0_user_model(**payload)
         except ValidationError as e:
-            logger.error(f"Handled exception parsing Auth0User: {e}", exc_info=True)
+            logger.exception(f"Handled exception parsing Auth0User: {e}", exc_info=True)
             raise Auth0UnauthorizedException(detail="Error parsing Auth0User")
