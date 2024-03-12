@@ -1,11 +1,12 @@
 import json
 import logging
 import os
-from typing import Optional, Dict, List, Type
+from typing import Any, Optional, Dict, List, Type
 import urllib.parse
 import urllib.request
 
-from jose import jwt  # type: ignore
+import jwt
+from jwt import PyJWKClient
 from fastapi import HTTPException, Depends, Request
 from fastapi.security import SecurityScopes, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.security import OAuth2, OAuth2PasswordBearer, OAuth2AuthorizationCodeBearer, OpenIdConnect
@@ -88,8 +89,6 @@ class Auth0:
         self.auth0_user_model = auth0user_model
 
         self.algorithms = ['RS256']
-        r = urllib.request.urlopen(f'https://{domain}/.well-known/jwks.json')
-        self.jwks: JwksDict = json.loads(r.read())
 
         authorization_url_qs = urllib.parse.urlencode({'audience': api_audience})
         authorization_url = f'https://{domain}/authorize?{authorization_url_qs}'
@@ -103,11 +102,13 @@ class Auth0:
             tokenUrl=f'https://{domain}/oauth/token',
             scopes=scopes)
         self.oidc_scheme = OpenIdConnect(openIdConnectUrl=f'https://{domain}/.well-known/openid-configuration')
-
+        url = f'https://{self.domain}/.well-known/jwks.json'
+        self.jwks_client = PyJWKClient(url)
 
     async def get_user(self,
         security_scopes: SecurityScopes,
         creds: Optional[HTTPAuthorizationCredentials] = Depends(Auth0HTTPBearer(auto_error=False)),
+        options: dict[str, Any] | None = None,
     ) -> Optional[Auth0User]:
         """
         Verify the Authorization: Bearer token and return the user.
@@ -127,79 +128,10 @@ class Auth0:
                 return None
 
         token = creds.credentials
-        payload: Dict = {}
-        try:
-            unverified_header = jwt.get_unverified_header(token)
+        payload = self.decode_token(token, options)
 
-            if 'kid' not in unverified_header:
-                msg = 'Malformed token header'
-                if self.auto_error:
-                    raise Auth0UnauthenticatedException(detail=msg)
-                else:
-                    logger.warning(msg)
-                    return None
-
-            rsa_key = {}
-            for key in self.jwks['keys']:
-                if key['kid'] == unverified_header['kid']:
-                    rsa_key = {
-                        'kty': key['kty'],
-                        'kid': key['kid'],
-                        'use': key['use'],
-                        'n': key['n'],
-                        'e': key['e']
-                    }
-                    break
-            if rsa_key:
-                payload = jwt.decode(
-                    token,
-                    rsa_key,
-                    algorithms=self.algorithms,
-                    audience=self.audience,
-                    issuer=f'https://{self.domain}/'
-                )
-            else:
-                msg = 'Invalid kid header (wrong tenant or rotated public key)'
-                if self.auto_error:
-                    raise Auth0UnauthenticatedException(detail=msg)
-                else:
-                    logger.warning(msg)
-                    return None
-
-        except jwt.ExpiredSignatureError:
-            msg = 'Expired token'
-            if self.auto_error:
-                raise Auth0UnauthenticatedException(detail=msg)
-            else:
-                logger.warning(msg)
-                return None
-
-        except jwt.JWTClaimsError:
-            msg = 'Invalid token claims (wrong issuer or audience)'
-            if self.auto_error:
-                raise Auth0UnauthenticatedException(detail=msg)
-            else:
-                logger.warning(msg)
-                return None
-
-        except jwt.JWTError:
-            msg = 'Malformed token'
-            if self.auto_error:
-                raise Auth0UnauthenticatedException(detail=msg)
-            else:
-                logger.warning(msg)
-                return None
-
-        except Auth0UnauthenticatedException:
-            raise
-
-        except Exception as e:
-            # This is an unlikely case but handle it just to be safe (maybe the token is specially crafted to bug our code)
-            logger.error(f'Handled exception decoding token: "{e}"', exc_info=True)
-            if self.auto_error:
-                raise Auth0UnauthenticatedException(detail='Error decoding token')
-            else:
-                return None
+        if not payload:
+            return None
 
         if self.scope_auto_error:
             token_scope_str: str = payload.get('scope', '')
@@ -229,3 +161,85 @@ class Auth0:
                 raise Auth0UnauthorizedException(detail='Error parsing Auth0User')
             else:
                 return None
+
+    def decode_token(self, token: str, options: dict[str, Any] | None = None):
+        try:
+            unverified_header = jwt.get_unverified_header(token)
+
+            if 'kid' not in unverified_header:
+                msg = 'Malformed token header'
+                if self.auto_error:
+                    raise Auth0UnauthenticatedException(detail=msg)
+                else:
+                    logger.warning(msg)
+                    return None
+            try:
+                signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+                options = options or {}
+                leeway = options.pop("leeway", 0)
+                payload = jwt.decode(
+                    token,
+                    signing_key.key,
+                    algorithms=self.algorithms,
+                    audience=self.audience,
+                    issuer=f'https://{self.domain}/',
+                    leeway=leeway,
+                    options=options,
+                )
+                return payload
+            except jwt.PyJWKClientError as e:
+                msg = str(e)
+                if self.auto_error:
+                    raise Auth0UnauthenticatedException(detail=msg)
+                else:
+                    logger.warning(msg)
+                    return None
+
+        except jwt.ExpiredSignatureError:
+            msg = 'Expired token'
+            if self.auto_error:
+                raise Auth0UnauthenticatedException(detail=msg)
+            else:
+                logger.warning(msg)
+                return None
+
+        except (jwt.InvalidAudienceError, jwt.InvalidIssuerError):
+            msg = 'Invalid token claims (wrong issuer or audience)'
+            if self.auto_error:
+                raise Auth0UnauthenticatedException(detail=msg)
+            else:
+                logger.warning(msg)
+                return None
+
+        except jwt.PyJWTError as e:
+            msg = f'Malformed token: {e}'
+            if self.auto_error:
+                raise Auth0UnauthenticatedException(detail=msg)
+            else:
+                logger.warning(msg)
+                return None
+
+        except Auth0UnauthenticatedException:
+            raise
+
+        except Exception as e:
+            # This is an unlikely case but handle it just to be safe (maybe the token is specially crafted to bug our code)
+            logger.error(f'Handled exception decoding token: "{e}"', exc_info=True)
+            if self.auto_error:
+                raise Auth0UnauthenticatedException(detail='Error decoding token')
+            else:
+                return None
+
+    def get_auth0_user_from_token(self, token: str, options: dict[str, Any] | None = None) -> Auth0User:
+        """Verifies an Auth0 token and returns an Auth0User instance for the decoded information."""
+        payload = self.decode_token(token, options=options)
+        if not payload:
+            raise Auth0UnauthenticatedException(
+                detail="Invalid kid header (wrong tenant or rotated public key)"
+            )
+
+        try:
+            return self.auth0_user_model(**payload)
+        except ValidationError as e:
+            logger.exception(f"Handled exception parsing Auth0User: {e}", exc_info=True)
+            raise Auth0UnauthorizedException(detail="Error parsing Auth0User")
