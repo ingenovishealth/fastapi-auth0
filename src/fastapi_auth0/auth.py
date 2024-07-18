@@ -175,7 +175,7 @@ class Auth0:
                     logger.warning(msg)
                     return None
             try:
-                signing_key = await run_in_threadpool(self.jwks_client.get_signing_key_from_jwt, self, token)
+                signing_key = await run_in_threadpool(self.jwks_client.get_signing_key_from_jwt, token)
                 options = options or {}
                 leeway = options.pop("leeway", 0)
                 payload = jwt.decode(
