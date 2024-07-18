@@ -8,6 +8,7 @@ import urllib.request
 import jwt
 from jwt import PyJWKClient
 from fastapi import HTTPException, Depends, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security import SecurityScopes, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.security import OAuth2, OAuth2PasswordBearer, OAuth2AuthorizationCodeBearer, OpenIdConnect
 from fastapi.openapi.models import OAuthFlows, OAuthFlowImplicit
@@ -128,7 +129,7 @@ class Auth0:
                 return None
 
         token = creds.credentials
-        payload = self.decode_token(token, options)
+        payload = await self.decode_token(token, options)
 
         if not payload:
             return None
@@ -162,7 +163,7 @@ class Auth0:
             else:
                 return None
 
-    def decode_token(self, token: str, options: dict[str, Any] | None = None):
+    async def decode_token(self, token: str, options: dict[str, Any] | None = None):
         try:
             unverified_header = jwt.get_unverified_header(token)
 
@@ -174,7 +175,7 @@ class Auth0:
                     logger.warning(msg)
                     return None
             try:
-                signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+                signing_key = await run_in_threadpool(self.jwks_client.get_signing_key_from_jwt, self, token)
                 options = options or {}
                 leeway = options.pop("leeway", 0)
                 payload = jwt.decode(
@@ -230,9 +231,9 @@ class Auth0:
             else:
                 return None
 
-    def get_auth0_user_from_token(self, token: str, options: dict[str, Any] | None = None) -> Auth0User:
+    async def get_auth0_user_from_token(self, token: str, options: dict[str, Any] | None = None) -> Auth0User:
         """Verifies an Auth0 token and returns an Auth0User instance for the decoded information."""
-        payload = self.decode_token(token, options=options)
+        payload = await self.decode_token(token, options=options)
         if not payload:
             raise Auth0UnauthenticatedException(
                 detail="Invalid kid header (wrong tenant or rotated public key)"
